@@ -4,7 +4,8 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-imessage-utils = {git = "https://github.com/christo4b/imessage_utils.git"}
+pytest = "*"
+imessage-utils = {editable = true, git = "https://github.com/christo4b/imessage_utils.git"}
 
 [dev-packages]
 
