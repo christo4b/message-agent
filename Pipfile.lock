@@ -1,0 +1,26 @@
+{
+    "_meta": {
+        "hash": {
+            "sha256": "d917c75284eb627f1e2c2c85fd2da93b5658c7a0acd89d8d8a0b878b75cf3d2f"
+        },
+        "pipfile-spec": 6,
+        "requires": {
+            "python_full_version": "3.13.1",
+            "python_version": "3.13"
+        },
+        "sources": [
+            {
+                "name": "pypi",
+                "url": "https://pypi.org/simple",
+                "verify_ssl": true
+            }
+        ]
+    },
+    "default": {
+        "imessage-utils": {
+            "git": "https://github.com/christo4b/imessage_utils.git",
+            "ref": "cd3483c98ac8528375218b2bc23061df2f01150f"
+        }
+    },
+    "develop": {}
+}
