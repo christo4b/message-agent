@@ -6,6 +6,11 @@ name = "pypi"
 [packages]
 pytest = "*"
 imessage-utils = {editable = true, git = "https://github.com/christo4b/imessage_utils.git"}
+langchain = "*"
+langchain-community = "*"
+langchain-core = "*"
+pydantic = "*"
+click = "*"
 
 [dev-packages]
 
