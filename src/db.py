@@ -89,18 +89,24 @@ class MessagesDB:
        return results[0]['count'] if results else 0
 
    def get_unresponded_messages(self, days_ago: int = 14) -> List[Dict[str, Any]]:
+       """Get recent message threads"""
        query = """
-       SELECT 
-           message.ROWID as msg_id,
-           message.date/1000000000 + 978307200 as timestamp,
-           message.text,
-           message.is_from_me,
-           handle.id as contact
-       FROM message 
-       JOIN handle ON message.handle_id = handle.ROWID
-       WHERE is_from_me = 0 
-       AND message.date/1000000000 + 978307200 >= strftime('%s', 'now', '-' || ? || ' days') + 978307200
-       ORDER BY message.date DESC
+       WITH RecentMessages AS (
+           SELECT 
+               message.ROWID as msg_id,
+               message.date/1000000000 + 978307200 as timestamp,
+               message.text,
+               message.is_from_me,
+               handle.id as contact,
+               ROW_NUMBER() OVER (PARTITION BY handle.id ORDER BY message.date DESC) as rn
+           FROM message 
+           JOIN handle ON message.handle_id = handle.ROWID
+           WHERE message.date/1000000000 + 978307200 >= strftime('%s', 'now', '-' || ? || ' days')
+           AND message.text IS NOT NULL
+       )
+       SELECT * FROM RecentMessages 
+       WHERE rn = 1  -- Get most recent message from each conversation
+       ORDER BY timestamp DESC
        """
        return self.execute_query(query, (str(days_ago),))
 
@@ -114,16 +120,19 @@ class MessagesDB:
 #        self.execute_write(query, (response, current_time, msg_id))
 
    def get_contact_messages(self, contact_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+       """Get recent conversation history with a contact"""
        query = """
        SELECT 
            message.ROWID as msg_id,
            message.date/1000000000 + 978307200 as timestamp,
            message.text,
            message.is_from_me,
-           handle.id as contact
+           handle.id as contact,
+           datetime(message.date/1000000000 + 978307200, 'unixepoch', 'localtime') as formatted_date
        FROM message 
-       LEFT JOIN handle ON message.handle_id = handle.ROWID
+       JOIN handle ON message.handle_id = handle.ROWID
        WHERE handle.id = ?
+       AND message.text IS NOT NULL
        ORDER BY message.date DESC
        LIMIT ?
        """
