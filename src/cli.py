@@ -1,6 +1,6 @@
 import asyncio
 import click
-from src.agent import MessageAgent
+from .agent import MessageAgent
 
 @click.group()
 def cli():
