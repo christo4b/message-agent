@@ -1270,11 +1270,14 @@ def test_messages(days):
 @cli.command()
 @click.option('--days', default=1, help='Number of days to look back')
 def test_agent(days):
-    """Test the agent's ability to fetch and respond to messages"""
+    """Test the agent with interactive message sending"""
     agent = MessageAgent()
+    messages = agent.message_service.get_pending_messages(days_lookback=days)
     
-    # Get messages needing responses
-    messages = agent.message_service.get_pending_messages(days)
+    if not messages:
+        click.echo(f"\nNo messages found needing responses from last {days} days.")
+        return
+        
     click.echo(f"\nFound {len(messages)} messages needing responses from last {days} days:")
     
     for msg in messages:
@@ -1283,18 +1286,50 @@ def test_agent(days):
         click.echo(f"Message: {msg['text']}")
         click.echo(f"Time: {msg['formatted_time']}")
         
-        # Get conversation history for context
-        history = agent.message_service.get_conversation_history(msg['contact'], limit=5)
+        # Get conversation history
+        history = agent.message_service.get_conversation_history(msg['contact'])
         click.echo("\nRecent conversation history:")
-        for hist_msg in history:
-            direction = "→" if hist_msg['is_from_me'] else "←"
-            click.echo(f"{direction} {hist_msg.get('text', '')}")
-        
-        # Have the agent draft a response
+        for h in history:
+            direction = "→" if h['is_from_me'] else "←"
+            click.echo(f"{direction} {h['text']}")
+            
         click.echo("\nDrafting response...")
         result = agent.handle_message(msg['contact'], msg['text'])
-        click.echo(f"Agent result: {result}")
-        click.echo("========================\n")
+        click.echo(f"\nSuggested response: {result}")
+        
+        while True:
+            action = click.prompt(
+                "\nWhat would you like to do?\n"
+                "[s]end suggested response\n"
+                "[e]dit and send response\n"
+                "[n]ext message\n"
+                "[q]uit\n"
+                "> "
+            ).lower()
+            
+            if action == 's':
+                success = agent.message_service.send_message(msg['contact'], result)
+                if success:
+                    click.echo("Message sent successfully!")
+                else:
+                    click.echo("Failed to send message.")
+                break
+            elif action == 'e':
+                edited = click.prompt("Enter your edited response")
+                success = agent.message_service.send_message(msg['contact'], edited)
+                if success:
+                    click.echo("Message sent successfully!")
+                else:
+                    click.echo("Failed to send message.")
+                break
+            elif action == 'n':
+                break
+            elif action == 'q':
+                return
+            else:
+                click.echo("Invalid option, please try again.")
+                
+    click.echo("\nFinished processing all messages.")
 
 if __name__ == '__main__':
     cli()

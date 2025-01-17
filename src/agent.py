@@ -81,3 +81,11 @@ Suggested response:"""
             return response.strip()
         except Exception as e:
             return f"Error handling message: {str(e)}"
+
+    def send_message(self, contact: str, message: str) -> bool:
+        """Send a message to a contact"""
+        try:
+            return self.message_service.send_message(contact, message)
+        except Exception as e:
+            print(f"Error sending message: {str(e)}")
+            return False

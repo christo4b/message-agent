@@ -20,13 +20,7 @@ class MessageService:
 
     def get_pending_messages(self, days_lookback: int = 14) -> List[Dict]:
         """Get messages that need responses"""
-        messages = self.get_recent_messages(days_lookback)
-        # Filter messages that need responses
-        return [
-            msg for msg in messages 
-            if not msg['is_from_me']  # Not sent by me
-            and msg.get('text')  # Has text content
-        ]
+        return self.db.get_unresponded_messages(days_lookback)
 
     def draft_message(self, contact: str, message: str) -> str:
         """Draft a message for later approval"""
@@ -43,4 +37,14 @@ class MessageService:
 
     def send_message(self, contact: str, message: str) -> bool:
         """Send a message to a contact"""
-        return self.message_sender.send_message(contact, message)
+        print(f"\nAttempting to send message:")
+        print(f"Contact: {contact}")
+        print(f"Message: {message}")
+        try:
+            result = self.message_sender.send(contact, message)
+            print(f"Send result: {result}")
+            return result
+        except Exception as e:
+            print(f"Error sending message: {str(e)}")
+            print(f"Error type: {type(e)}")
+            return False

@@ -112,7 +112,7 @@ class MessagesDB:
                message.account,
                COALESCE(chat.display_name, message.cache_roomnames) as group_name,
                COALESCE(chat.chat_identifier, message.group_title) as group_id,
-               handle.id as contact_id,
+               handle.id as contact,
                message.cache_has_attachments,
                (
                    SELECT GROUP_CONCAT(filename)
@@ -126,7 +126,7 @@ class MessagesDB:
            LEFT JOIN chat_message_join ON message.ROWID = chat_message_join.message_id
            LEFT JOIN chat ON chat_message_join.chat_id = chat.ROWID
            WHERE message.is_from_me = 0
-           AND message.date/1000000000 + 978307200 >= strftime('%s', 'now', '-' || ? || ' days')
+           AND date(message.date/1000000000 + 978307200, 'unixepoch', 'localtime') >= date('now', '-' || ? || ' days')
            AND NOT EXISTS (
                SELECT 1
                FROM message m2
@@ -166,7 +166,7 @@ class MessagesDB:
                'account': row['account'],
                'group_name': row['group_name'],
                'group_id': row['group_id'],
-               'contact_id': row['contact_id'],
+               'contact': row['contact'],
                'has_attachments': bool(row['cache_has_attachments']),
                'attachments': row['attachments'].split(',') if row['attachments'] else []
            }
