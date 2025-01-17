@@ -1,48 +1,46 @@
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
-from src.db import MessagesDB
-from imessage_utils.sender import IMessageSender
 import os
-import shutil
-
+from typing import Dict, List, Optional
+from .db import MessagesDB
+from imessage_utils.sender import IMessageSender
 
 class MessageService:
-    """Service for interacting with iMessage"""
+    """Service for managing iMessages"""
 
     def __init__(self, message_sender: IMessageSender, db_path: str = None):
-        """Initialize the message service
-
-        Args:
-            message_sender: The message sender implementation
-            db_path: Optional path to messages.db. If not provided, uses default location
-        """
-        self.message_sender = message_sender
+        """Initialize the service with a message sender and database"""
         if db_path is None:
             db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'messages.db')
-        self.db_path = db_path
-        self.db = MessagesDB(self.db_path)
+        self.db = MessagesDB(db_path)
+        self.message_sender = message_sender
+        self.draft_messages = {}  # Store draft messages for approval
 
-    def get_pending_messages(self, days_lookback: int = 14) -> List[Dict[str, Any]]:
+    def get_recent_messages(self, days_lookback: int = 14) -> List[Dict]:
+        """Get all messages from the last N days"""
+        return self.db.get_recent_messages(days_lookback)
+
+    def get_pending_messages(self, days_lookback: int = 14) -> List[Dict]:
         """Get messages that need responses"""
-        messages = self.db.get_unresponded_messages(days_lookback)
-        for message in messages:
-            message['context'] = self.db.get_message_with_context(message['msg_id'])
-            message['daily_count'] = self.db.get_daily_message_count(message['contact'])
-        return messages
+        messages = self.get_recent_messages(days_lookback)
+        # Filter messages that need responses
+        return [
+            msg for msg in messages 
+            if not msg['is_from_me']  # Not sent by me
+            and msg.get('text')  # Has text content
+        ]
 
-    def get_conversation_history(self, contact_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent conversation history with a contact"""
-        return self.db.get_contact_messages(contact_id, limit)
+    def draft_message(self, contact: str, message: str) -> str:
+        """Draft a message for later approval"""
+        draft_id = len(self.draft_messages)
+        self.draft_messages[draft_id] = {
+            'contact': contact,
+            'message': message
+        }
+        return f"Draft message #{draft_id} created for {contact}: '{message}'\nPlease ask the user to review and approve this message before sending."
+
+    def get_conversation_history(self, contact_id: str = "", limit: int = 10) -> List[Dict]:
+        """Get conversation history with a contact"""
+        return self.db.get_conversation_history(contact_id, limit)
 
     def send_message(self, contact: str, message: str) -> bool:
-        """Send a message to a contact. Returns True if successful, False otherwise."""
-        success = self.message_sender.send(contact, message)
-        if not success:
-            raise Exception(f"Failed to send message to {contact}")
-        return success
-
-    def reply_to_message(self, msg_id: int, response: str) -> None:
-        """Reply to a specific message and mark it as responded"""
-        contact_info = self.db.get_message_with_context(msg_id)
-        self.send_message(contact_info['contact'], response)
-        self.db.mark_message_responded(msg_id)
+        """Send a message to a contact"""
+        return self.message_sender.send_message(contact, message)

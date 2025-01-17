@@ -9,6 +9,7 @@ setup(
         "langchain-community",
         "langchain-core",
         "langchain-ollama",
+        "langgraph",
         "pydantic>=2.0",
         "click",
     ],

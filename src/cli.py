@@ -1,8 +1,12 @@
 import asyncio
 import click
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from .agent import MessageAgent
+from .db import MessagesDB
+import sqlite3
+import re
+import subprocess
 
 @click.group()
 def cli():
@@ -581,6 +585,716 @@ def dump_today():
             for key, value in row.items():
                 if value is not None:
                     click.echo(f"{key}: {value}")
+
+@cli.command()
+@click.argument('contact')
+@click.option('--days', default=1, help='Number of days to look back')
+def check_contact_groups(contact, days):
+    """Check all group messages involving a specific contact"""
+    agent = MessageAgent()
+    db = agent.message_service.db
+
+    # First find the specific chat we know exists
+    query1 = """
+    SELECT 
+        c.ROWID as chat_id,
+        c.chat_identifier,
+        c.display_name,
+        COUNT(DISTINCT m.ROWID) as message_count,
+        MIN(datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime')) as first_message,
+        MAX(datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime')) as last_message
+    FROM chat c
+    JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
+    JOIN message m ON cmj.message_id = m.ROWID
+    WHERE c.chat_identifier = 'chat363848444324532031'
+    GROUP BY c.ROWID, c.chat_identifier, c.display_name
+    """
+    
+    chats = db.execute_query(query1)
+    
+    if not chats:
+        click.echo(f"\nCould not find chat363848444324532031")
+        return
+        
+    chat = chats[0]
+    click.echo(f"\nFound chat:")
+    click.echo(f"  Identifier: {chat['chat_identifier']}")
+    click.echo(f"  Display Name: {chat['display_name'] or 'Not set'}")
+    click.echo(f"  Total Messages: {chat['message_count']}")
+    click.echo(f"  First Message: {chat['first_message']}")
+    click.echo(f"  Last Message: {chat['last_message']}")
+    
+    # Get recent messages in this chat
+    query2 = """
+    SELECT 
+        m.ROWID,
+        m.date as raw_date,
+        datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as time,
+        m.text,
+        hex(m.attributedBody) as attributed_body_hex,
+        h.id as sender,
+        m.is_from_me,
+        m.service,
+        m.account,
+        m.cache_has_attachments,
+        (
+            SELECT GROUP_CONCAT(filename)
+            FROM attachment
+            JOIN message_attachment_join 
+            ON attachment.ROWID = message_attachment_join.attachment_id
+            WHERE message_attachment_join.message_id = m.ROWID
+        ) as attachments
+    FROM message m
+    JOIN handle h ON m.handle_id = h.ROWID
+    JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    WHERE cmj.chat_id = ?
+    AND m.date >= (
+        SELECT MAX(m2.date) - (? * 24 * 60 * 60 * 1000000000)
+        FROM message m2
+        JOIN chat_message_join cmj2 ON m2.ROWID = cmj2.message_id
+        WHERE cmj2.chat_id = cmj.chat_id
+    )
+    ORDER BY m.date DESC
+    """
+    
+    messages = db.execute_query(query2, (chat['chat_id'], str(days)))
+    
+    if messages:
+        click.echo(f"\nRecent Messages ({len(messages)}):")
+        for msg in messages:
+            click.echo("\n---")
+            click.echo(f"ROWID: {msg['ROWID']}")
+            click.echo(f"Raw Date: {msg['raw_date']}")
+            click.echo(f"Time: {msg['time']}")
+            click.echo(f"From: {msg['sender']}")
+            click.echo(f"Service: {msg['service']} ({msg['account'] or 'default account'})")
+            click.echo(f"Direction: {'→' if msg['is_from_me'] else '←'}")
+            
+            # Get text from attributedBody if text is empty
+            text = msg['text']
+            if not text and msg['attributed_body_hex']:
+                try:
+                    blob = bytes.fromhex(msg['attributed_body_hex'])
+                    text = blob.decode('utf-8', errors='ignore')
+                    # Clean up the text
+                    if text.startswith('streamtyped@'):
+                        text = text[len('streamtyped@'):]
+                    if 'NSString+' in text:
+                        text = text.split('NSString+')[1]
+                    if 'i__kIMMessagePartAttributeName' in text:
+                        text = text.split('i__kIMMessagePartAttributeName')[0]
+                    text = text.strip()
+                except:
+                    text = None
+                    
+            click.echo(f"Text: {text or '(empty)'}")
+            
+            if msg['cache_has_attachments'] and msg['attachments']:
+                click.echo(f"Attachments: {msg['attachments']}")
+    else:
+        click.echo("\nNo other messages found in the same group")
+
+@cli.command()
+@click.option('--days', default=1, help='Number of days to look back')
+@click.option('--contact', help='Contact ID to filter by')
+def debug_messages(days, contact):
+    """Debug message retrieval by showing raw query results"""
+    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'messages.db')
+    db = MessagesDB(db_path)
+    
+    # Use a reference timestamp and buffer like in the working query
+    reference_time = 758751495079831168  # From the working query
+    buffer = 1000000000000  # ~16 minutes buffer
+    
+    query = """
+    SELECT 
+        message.ROWID,
+        message.text,
+        message.service,
+        message.account,
+        message.date,
+        message.is_from_me,
+        message.cache_has_attachments,
+        COALESCE(chat.display_name, message.cache_roomnames) as group_name,
+        COALESCE(chat.chat_identifier, message.group_title) as group_id,
+        handle.id as contact_id,
+        datetime(message.date/1000000000 + 978307200, 'unixepoch', 'localtime') as formatted_time
+    FROM message
+    JOIN handle ON message.handle_id = handle.ROWID
+    LEFT JOIN chat_message_join ON message.ROWID = chat_message_join.message_id
+    LEFT JOIN chat ON chat_message_join.chat_id = chat.ROWID
+    WHERE message.date BETWEEN ? - ? AND ? + ?
+    """
+    
+    if contact:
+        query += " AND handle.id = ?"
+        params = (reference_time, buffer, reference_time, buffer, contact)
+    else:
+        params = (reference_time, buffer, reference_time, buffer)
+    
+    query += " ORDER BY message.date DESC"
+    
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.execute(query, params)
+        
+        results = cursor.fetchall()
+        click.echo(f"\nFound {len(results)} messages:\n")
+        
+        for row in results:
+            click.echo("=" * 50)
+            click.echo(f"ID: {row[0]}")
+            click.echo(f"Time: {row[10]}")  # formatted_time
+            click.echo(f"From Me: {bool(row[5])}")
+            click.echo(f"Service: {row[2]}")
+            click.echo(f"Account: {row[3]}")
+            click.echo(f"Group: {row[7] or 'N/A'}")
+            click.echo(f"Group ID: {row[8] or 'N/A'}")
+            click.echo(f"Contact: {row[9]}")
+            click.echo(f"Has Attachments: {bool(row[6])}")
+            click.echo(f"Text: {row[1] or '(empty)'}")
+            click.echo()
+
+@cli.command()
+@click.option('--days', default=1, help='Number of days to look back')
+def debug_sql(days):
+    """Debug SQL query execution for message retrieval"""
+    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'messages.db')
+    
+    # Get current timestamp and cutoff
+    now = int(datetime.now().timestamp())
+    cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
+    
+    click.echo(f"\nDebug info:")
+    click.echo(f"Current time: {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
+    click.echo(f"Cutoff time: {datetime.fromtimestamp(cutoff).strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Convert to Apple epoch
+    now_apple = (now - 978307200) * 1000000000
+    cutoff_apple = (cutoff - 978307200) * 1000000000
+    
+    click.echo(f"\nApple epoch values:")
+    click.echo(f"Current time: {now_apple}")
+    click.echo(f"Cutoff time: {cutoff_apple}")
+    
+    # Connect directly to get binary data
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        query = """
+        SELECT 
+            message.ROWID,
+            message.text,
+            message.attributedBody,
+            message.date,
+            message.date/1000000000 + 978307200 as unix_timestamp,
+            datetime(message.date/1000000000 + 978307200, 'unixepoch', 'localtime') as formatted_time,
+            message.is_from_me,
+            message.service,
+            message.account,
+            message.cache_has_attachments,
+            COALESCE(chat.display_name, message.cache_roomnames) as group_name,
+            COALESCE(chat.chat_identifier, message.group_title) as group_id,
+            handle.id as contact_id,
+            (
+                SELECT GROUP_CONCAT(filename)
+                FROM attachment
+                JOIN message_attachment_join 
+                ON attachment.ROWID = message_attachment_join.attachment_id
+                WHERE message_attachment_join.message_id = message.ROWID
+            ) as attachments
+        FROM message
+        JOIN handle ON message.handle_id = handle.ROWID
+        LEFT JOIN chat_message_join ON message.ROWID = chat_message_join.message_id
+        LEFT JOIN chat ON chat_message_join.chat_id = chat.ROWID
+        WHERE message.date >= ?
+        ORDER BY message.date DESC
+        LIMIT 10
+        """
+        
+        cursor = conn.execute(query, (cutoff_apple,))
+        results = cursor.fetchall()
+    
+    def extract_text_from_blob(blob):
+        if not blob:
+            return None
+        try:
+            # Try different text extraction methods
+            text = None
+            
+            # Method 1: Direct UTF-8 decode
+            try:
+                text = blob.decode('utf-8', errors='ignore')
+            except:
+                pass
+            
+            if text:
+                # Remove common prefixes
+                prefixes = [
+                    'streamtyped@NSObject',
+                    'streamtyped@NSMutableAttributedString',
+                    'streamtyped@',
+                    'NSObject',
+                    'NSMutableString',
+                    'NSString+',
+                ]
+                for prefix in prefixes:
+                    if text.startswith(prefix):
+                        text = text[len(prefix):]
+                
+                # Remove common suffixes and their variations
+                suffixes = [
+                    'i__kIMMessagePartAttributeName',
+                    'iIi__kIMMessagePartAttributeName',
+                    'iI i__kIMMessagePartAttributeName',
+                    'iI.i__kIMMessagePartAttributeName',
+                    'iI9i__kIMMessagePartAttributeName',
+                    'NSNumberNSValue*',
+                    'i&__kIMBaseWritingDirectionAttributeName',
+                    'i"__kIMFileTransferGUIDAttributeName',
+                    'q__kIMMessagePartAttributeName',
+                    'Mi__kIMMessagePartAttributeName',
+                    '&__kIMDataDetectedAttributeName',
+                    '__kIMLinkAttributeName',
+                ]
+                for suffix in suffixes:
+                    if suffix in text:
+                        text = text.split(suffix)[0]
+                
+                # Clean up the text
+                text = text.replace('\x00', '')
+                text = ''.join(c for c in text if c.isprintable() or c in ['\n', ' '])
+                
+                # Remove any remaining markers and their variations
+                markers = [
+                    'NSString+',
+                    'NSDictionary',
+                    'NSAttributedString',
+                    'NSMutableString',
+                    'NSObject',
+                    'iI',
+                    'iIM',
+                    'NSData',
+                    'NSKeyedArchiver',
+                    'bplist00',
+                ]
+                for marker in markers:
+                    text = text.replace(marker, '')
+                
+                # Remove any remaining control characters and extra whitespace
+                text = ' '.join(text.split())
+                
+                # Remove any remaining single character markers
+                text = ' '.join(word for word in text.split() if len(word) > 1 or word.isalnum())
+                
+                # Clean up URLs
+                if 'http' in text:
+                    parts = text.split('http')
+                    text = parts[0].strip()
+                    if len(parts) > 1:
+                        url = 'http' + parts[1].split()[0]
+                        text = f"{text} {url}"
+                
+                # Remove any remaining metadata markers
+                text = text.replace('at_0_', '')
+                text = re.sub(r'[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}', '', text, flags=re.IGNORECASE)
+                
+                # Clean up any remaining artifacts
+                text = text.replace('￼', '')
+                text = re.sub(r'^\W+', '', text)  # Remove leading non-word characters
+                text = re.sub(r'\W+$', '', text)  # Remove trailing non-word characters
+                text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+                
+                return text.strip() if text.strip() else None
+            
+        except Exception as e:
+            click.echo(f"Error extracting text: {e}")
+        return None
+    
+    click.echo(f"\nFound {len(results)} messages since {datetime.fromtimestamp(cutoff).strftime('%Y-%m-%d %H:%M:%S')}:")
+    for row in results:
+        click.echo("\n---")
+        click.echo(f"ROWID: {row['ROWID']}")
+        click.echo(f"Time: {row['formatted_time']}")
+        click.echo(f"Raw date: {row['date']}")
+        click.echo(f"Unix timestamp: {row['unix_timestamp']}")
+        click.echo(f"Service: {row['service']}")
+        click.echo(f"Account: {row['account']}")
+        click.echo(f"Contact: {row['contact_id']}")
+        click.echo(f"Group: {row['group_name'] or row['group_id'] or 'N/A'}")
+        click.echo(f"Direction: {'→' if row['is_from_me'] else '←'}")
+        click.echo(f"Has attachments: {bool(row['cache_has_attachments'])}")
+        if row['attachments']:
+            click.echo(f"Attachments: {row['attachments']}")
+        
+        # Try to get text content
+        text = row['text']
+        if not text:
+            text = extract_text_from_blob(row['attributedBody'])
+        if text:
+            click.echo(f"Text: {text}")
+
+@cli.command()
+@click.argument('contact')
+@click.option('--days', default=1, help='Number of days to look back')
+def debug_contact(contact, days):
+    """Debug all information about a contact's messages"""
+    agent = MessageAgent()
+    db = agent.message_service.db
+    
+    # Get current time and cutoff
+    now = int(datetime.now().timestamp())
+    cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
+    
+    # Convert to Apple epoch
+    now_apple = (now - 978307200) * 1000000000
+    cutoff_apple = (cutoff - 978307200) * 1000000000
+    
+    click.echo(f"\nDebug info for contact {contact}:")
+    click.echo(f"Current time: {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
+    click.echo(f"Cutoff time: {datetime.fromtimestamp(cutoff).strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # First check handle table
+    query1 = """
+    SELECT *
+    FROM handle
+    WHERE id = ?
+    """
+    results = db.execute_query(query1, (contact,))
+    click.echo(f"\nHandle information:")
+    for row in results:
+        for key, value in row.items():
+            click.echo(f"  {key}: {value}")
+    
+    # Check for any messages involving this handle
+    query2 = """
+    SELECT 
+        m.ROWID,
+        datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as time,
+        m.text,
+        m.is_from_me,
+        m.service,
+        m.account,
+        m.cache_roomnames,
+        m.group_title,
+        c.chat_identifier,
+        c.display_name,
+        c.ROWID as chat_id
+    FROM message m
+    JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+    WHERE h.id = ?
+    AND m.date >= ?
+    ORDER BY m.date DESC
+    """
+    results = db.execute_query(query2, (contact, cutoff_apple))
+    click.echo(f"\nFound {len(results)} direct messages:")
+    for row in results:
+        click.echo("\n---")
+        for key, value in row.items():
+            if value is not None:
+                click.echo(f"  {key}: {value}")
+    
+    # Check for group chats containing this handle
+    query3 = """
+    SELECT DISTINCT
+        c.ROWID as chat_id,
+        c.chat_identifier,
+        c.display_name,
+        m.cache_roomnames,
+        m.group_title,
+        COUNT(DISTINCT m.ROWID) as message_count,
+        MIN(datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime')) as first_message,
+        MAX(datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime')) as last_message
+    FROM message m
+    JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+    WHERE h.id = ?
+    GROUP BY COALESCE(c.ROWID, m.cache_roomnames, m.group_title)
+    HAVING MAX(m.date) >= ?
+    """
+    results = db.execute_query(query3, (contact, cutoff_apple))
+    click.echo(f"\nFound {len(results)} group chats:")
+    for row in results:
+        click.echo("\n---")
+        for key, value in row.items():
+            if value is not None:
+                click.echo(f"  {key}: {value}")
+    
+    # Finally check for messages in any group where this handle appears
+    query4 = """
+    SELECT DISTINCT
+        m.ROWID,
+        datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as time,
+        m.text,
+        h.id as sender,
+        m.is_from_me,
+        m.service,
+        m.account,
+        COALESCE(c.display_name, m.cache_roomnames) as group_name,
+        COALESCE(c.chat_identifier, m.group_title) as group_id
+    FROM message m
+    JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+    WHERE m.date >= ?
+    AND (
+        h.id = ?
+        OR EXISTS (
+            SELECT 1
+            FROM message m2
+            JOIN handle h2 ON m2.handle_id = h2.ROWID
+            LEFT JOIN chat_message_join cmj2 ON m2.ROWID = cmj2.message_id
+            WHERE h2.id = ?
+            AND (
+                (cmj2.chat_id = cmj.chat_id AND cmj.chat_id IS NOT NULL)
+                OR (m2.cache_roomnames = m.cache_roomnames AND m.cache_roomnames IS NOT NULL)
+                OR (m2.group_title = m.group_title AND m.group_title IS NOT NULL)
+            )
+        )
+    )
+    ORDER BY m.date DESC
+    """
+    results = db.execute_query(query4, (cutoff_apple, contact, contact))
+    click.echo(f"\nFound {len(results)} messages in groups with this contact:")
+    for row in results:
+        click.echo("\n---")
+        for key, value in row.items():
+            if value is not None:
+                click.echo(f"  {key}: {value}")
+
+@cli.command()
+@click.argument('message_id', type=int)
+def debug_message_group(message_id):
+    """Debug a specific message and its group chat context"""
+    agent = MessageAgent()
+    db = agent.message_service.db
+    
+    # First get the message details
+    query1 = """
+    SELECT 
+        m.ROWID,
+        m.text,
+        hex(m.attributedBody) as attributed_body_hex,
+        m.date,
+        datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as formatted_time,
+        m.is_from_me,
+        h.id as sender,
+        m.service,
+        m.account,
+        m.cache_roomnames,
+        m.group_title,
+        c.ROWID as chat_id,
+        c.chat_identifier,
+        c.display_name,
+        m.cache_has_attachments,
+        (
+            SELECT GROUP_CONCAT(filename)
+            FROM attachment
+            JOIN message_attachment_join 
+            ON attachment.ROWID = message_attachment_join.attachment_id
+            WHERE message_attachment_join.message_id = m.ROWID
+        ) as attachments
+    FROM message m
+    JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+    WHERE m.ROWID = ?
+    """
+    
+    message = db.execute_query(query1, (message_id,))
+    if not message:
+        click.echo(f"No message found with ID {message_id}")
+        return
+        
+    message = message[0]
+    click.echo("\nMessage Details:")
+    for key, value in message.items():
+        if value is not None:
+            click.echo(f"  {key}: {value}")
+            
+    # Get text from attributedBody if text is empty
+    text = message['text']
+    if not text and message['attributed_body_hex']:
+        try:
+            blob = bytes.fromhex(message['attributed_body_hex'])
+            text = blob.decode('utf-8', errors='ignore')
+            # Clean up the text
+            if text.startswith('streamtyped@'):
+                text = text[len('streamtyped@'):]
+            if 'NSString+' in text:
+                text = text.split('NSString+')[1]
+            if 'i__kIMMessagePartAttributeName' in text:
+                text = text.split('i__kIMMessagePartAttributeName')[0]
+            text = text.strip()
+            click.echo(f"\nDecoded Text: {text}")
+        except Exception as e:
+            click.echo(f"Error decoding text: {e}")
+            
+    # Now get other messages in the same group
+    query2 = """
+    SELECT 
+        m.ROWID,
+        datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as time,
+        m.text,
+        hex(m.attributedBody) as attributed_body_hex,
+        h.id as sender,
+        m.is_from_me,
+        m.service,
+        m.account
+    FROM message m
+    JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+    LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+    WHERE (
+        (c.ROWID = ? AND ? IS NOT NULL)
+        OR (m.cache_roomnames = ? AND ? IS NOT NULL)
+        OR (m.group_title = ? AND ? IS NOT NULL)
+    )
+    AND m.ROWID != ?
+    AND ABS(m.date - ?) < 86400000000000  -- Messages within 24 hours
+    ORDER BY m.date DESC
+    """
+    
+    chat_id = message['chat_id']
+    cache_roomnames = message['cache_roomnames']
+    group_title = message['group_title']
+    
+    messages = db.execute_query(query2, (
+        chat_id, chat_id,
+        cache_roomnames, cache_roomnames,
+        group_title, group_title,
+        message_id,
+        message['date']
+    ))
+    
+    if messages:
+        click.echo(f"\nFound {len(messages)} other messages in the same group:")
+        for msg in messages:
+            click.echo("\n---")
+            click.echo(f"Time: {msg['time']}")
+            click.echo(f"From: {msg['sender']}")
+            click.echo(f"Service: {msg['service']} ({msg['account'] or 'default account'})")
+            click.echo(f"Direction: {'→' if msg['is_from_me'] else '←'}")
+            
+            # Get text from attributedBody if text is empty
+            text = msg['text']
+            if not text and msg['attributed_body_hex']:
+                try:
+                    blob = bytes.fromhex(msg['attributed_body_hex'])
+                    text = blob.decode('utf-8', errors='ignore')
+                    # Clean up the text
+                    if text.startswith('streamtyped@'):
+                        text = text[len('streamtyped@'):]
+                    if 'NSString+' in text:
+                        text = text.split('NSString+')[1]
+                    if 'i__kIMMessagePartAttributeName' in text:
+                        text = text.split('i__kIMMessagePartAttributeName')[0]
+                    text = text.strip()
+                except:
+                    text = None
+                    
+            click.echo(f"Text: {text or '(empty)'}")
+    else:
+        click.echo("\nNo other messages found in the same group")
+
+@cli.command()
+def sync():
+    """Sync messages by copying from ~/Library/Messages/chat.db"""
+    source_path = os.path.expanduser("~/Library/Messages/chat.db")
+    target_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'messages.db')
+
+    if not os.path.exists(source_path):
+        click.echo(f"Error: Source database not found at {source_path}")
+        return
+
+    # Get source file info (using sudo)
+    try:
+        stat_output = subprocess.check_output(['sudo', 'stat', '-f', '%z %m', source_path], text=True)
+        size, mtime = map(int, stat_output.strip().split())
+        click.echo(f"\nSource database info:")
+        click.echo(f"Path: {source_path}")
+        click.echo(f"Size: {size:,} bytes")
+        click.echo(f"Last modified: {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+    except subprocess.CalledProcessError as e:
+        click.echo(f"Error getting source file info: {str(e)}")
+        return
+
+    # Check if target exists and compare timestamps
+    if os.path.exists(target_path):
+        target_stat = os.stat(target_path)
+        click.echo(f"\nCurrent database info:")
+        click.echo(f"Path: {target_path}")
+        click.echo(f"Size: {target_stat.st_size:,} bytes")
+        click.echo(f"Last modified: {datetime.fromtimestamp(target_stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+
+        if target_stat.st_mtime >= mtime:
+            click.echo("\nLocal database is already up to date.")
+            return
+
+    # Copy the database using sudo
+    try:
+        subprocess.run(['sudo', 'cp', source_path, target_path], check=True)
+        # Fix permissions so we can access it
+        subprocess.run(['sudo', 'chown', f"{os.getuid()}:{os.getgid()}", target_path], check=True)
+        click.echo("\nSuccessfully synced messages database.")
+    except subprocess.CalledProcessError as e:
+        click.echo(f"\nError syncing database: {str(e)}")
+        return
+
+    # Verify the copy
+    if os.path.exists(target_path):
+        new_stat = os.stat(target_path)
+        click.echo(f"\nNew database info:")
+        click.echo(f"Size: {new_stat.st_size:,} bytes")
+        click.echo(f"Last modified: {datetime.fromtimestamp(new_stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+
+@cli.command()
+@click.option('--days', default=1, help='Number of days to look back')
+def test_messages(days):
+    """Simple test to fetch and display messages"""
+    agent = MessageAgent()
+    messages = agent.message_service.get_recent_messages(days)
+    click.echo(f"\nFound {len(messages)} messages from last {days} days:")
+    
+    for msg in messages:
+        click.echo("\n---")
+        click.echo(f"From: {msg['contact']}")
+        click.echo(f"Message: {msg['text']}")
+        click.echo(f"Time: {msg['formatted_time']}")
+        click.echo(f"Is from me: {msg['is_from_me']}")
+        if msg.get('group_name'):
+            click.echo(f"Group: {msg['group_name']}")
+        click.echo("---")
+
+@cli.command()
+@click.option('--days', default=1, help='Number of days to look back')
+def test_agent(days):
+    """Test the agent's ability to fetch and respond to messages"""
+    agent = MessageAgent()
+    
+    # Get messages needing responses
+    messages = agent.message_service.get_pending_messages(days)
+    click.echo(f"\nFound {len(messages)} messages needing responses from last {days} days:")
+    
+    for msg in messages:
+        click.echo("\n=== Processing Message ===")
+        click.echo(f"From: {msg['contact']}")
+        click.echo(f"Message: {msg['text']}")
+        click.echo(f"Time: {msg['formatted_time']}")
+        
+        # Get conversation history for context
+        history = agent.message_service.get_conversation_history(msg['contact'], limit=5)
+        click.echo("\nRecent conversation history:")
+        for hist_msg in history:
+            direction = "→" if hist_msg['is_from_me'] else "←"
+            click.echo(f"{direction} {hist_msg.get('text', '')}")
+        
+        # Have the agent draft a response
+        click.echo("\nDrafting response...")
+        result = agent.handle_message(msg['contact'], msg['text'])
+        click.echo(f"Agent result: {result}")
+        click.echo("========================\n")
 
 if __name__ == '__main__':
     cli()
